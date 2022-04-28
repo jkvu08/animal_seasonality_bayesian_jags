@@ -1,0 +1,21 @@
+
+    model {
+      for (i in 1:length(y)){
+        mu[i] <- alpha+ gamma[groupn[i]] + chi[groupm[i]] + beta*x[i]
+        y[i] ~ dnorm(mu[i], tau[groupv[i]])
+        ypred[i] ~ dnorm(mu[i], tau[groupv[i]])
+        log_lik[i] <- logdensity.norm(y[i],mu[i], tau[groupv[i]])
+      }
+      for (i in 1:n){
+        gamma[i] ~ dnorm(0,10)
+      }
+      for (i in 1:m){
+        chi[i] ~ dnorm(0,10)
+      }
+      for (i in 1:v){
+        sigma[i] ~ dunif(0,100)
+        tau[i] <- 1/(sigma[i]^2)
+      }
+      alpha ~ dnorm(0,10)
+      beta ~ dnorm(0,10)
+    }

@@ -1,0 +1,14 @@
+
+    model {
+      for (i in 1:length(y)){
+        logit(p[i]) <- beta[1]*frbw[i] + beta[2]*feed[i] + beta[3]*frprop[i]
+        w[i] ~ dbern(chi)
+        pi[i] <- w[i]*p[i]
+        y[i] ~ dbin(pi[i], n[i])
+        ypred[i] ~ dbin(pi[i], n[i])
+      }
+      for (i in 1:b){
+        beta[i] ~ dnorm(0,0.1)
+      }
+      chi ~ dunif(0,1)
+    }

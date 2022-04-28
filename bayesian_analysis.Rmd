@@ -1,0 +1,1194 @@
+---
+title: "animal_seasonality_bayesian"
+author: "Jannet Vu"
+date: "2/16/2022"
+output: html_document
+---
+
+Load in the packages, register cores for parallel computing, set working directory
+```{r, setup, echo=T, message=FALSE, warning=FALSE}
+library(devtools)
+library(ggplot2)
+library(reshape2)
+library(doParallel)
+library(tidyverse)
+library(dplyr)
+library(gridExtra)
+library(grid)
+library(raster)
+library(corrplot)
+library(bayesplot)
+library(corrgram)
+library(loo)
+library(R2jags)
+library(boot)
+library(abind)
+library(lubridate)
+library(MASS)
+library(MCMCpack)
+library(MCMCvis)
+library(corrgram)
+
+# detect cores for parallel computing
+numcores <- detectCores() -1
+registerDoParallel(numcores) # register cores
+
+```
+
+Load in data
+```{r, echo = T, eval = F}
+df <- read.csv('data.csv', header = T, stringsAsFactors = T)
+bw_df <- read.csv('biweekly_data.csv', header = T, stringsAsFactors = T)
+
+# covert categorical variables to factors
+df$reprostate <- factor(df$reprostate, levels = c('MEG','G','LAC','NR'))
+df$year <- factor(df$year, levels = 2010:2019)
+df$month <- factor(df$month, levels = 1:12)
+df$Sex <- as.factor(df$Sex)
+df$population <- as.factor(df$population)
+df$biweekly <- factor(df$biweekly, levels = 1:26)
+df$Individual <- as.factor(df$Individual)
+
+# convert categorical variables to factors
+bw_df$reprostate <- factor(bw_df$reprostate, levels = c('MEG','G','LAC','NR'))
+bw_df$year <- factor(bw_df$year, levels = 2010:2019)
+bw_df$population <- as.factor(bw_df$population)
+bw_df$biweekly <- factor(bw_df$biweekly, levels = 1:26)
+
+# duplicate dataframe to standardize
+df_std <- df
+bw_std <- bw_df
+
+# standardization function 
+std_fun <- function(df, ci, loc){
+  if (loc == 'same'){ # if loc is same then replace unstandardized values with standardized
+    df[,ci] <- (df[,ci] - mean(df[,ci],na.rm =T))/sd(df[,ci],na.rm=T) # standardize data
+  }
+  else{ # otherwise, put standardized data in new column 
+    df[,(ncol(df)+1)] <- (df[,ci] - mean(df[,ci],na.rm =T))/sd(df[,ci],na.rm=T) # standardize data
+    colnames(df)[ncol(df)] <- paste0(cname,'_std')
+  }
+  return(df) # return the dataframe
+}
+
+# standardize all continuous variables that are not proportions for follow data
+cov_list <- c(4:7,10:12,14:16,20:24,36,40:41) # pull column indices that need to be standardize
+cov_list <- c(10,11,12,13,16:21,25:29,42:43,46:50)
+for (i in cov_list){
+  std_full <- std_fun(std_full, i, 'same')
+}
+
+# for biweekly data
+cov_list <- c(7:15,21:28,30,38,43:44) # pull column indices that need to be standardize
+for (i in cov_list){
+  bw_std <- std_fun(bw_std, i, 'same')
+}
+
+# convert factors to integers
+cov_list <- c(1:3,8,9,13,17)
+cov_list <- c(3,5,22:24,31:33)
+
+for(i in cov_list){
+  std_full[,i] <- as.integer(as.factor(std_full[,i]))
+}
+
+cov_list <- c(1:4)
+for(i in cov_list){
+  bw_std[,i] <- as.integer(bw_std[,i])
+}
+
+```
+Functions to visualize modeling results
+```{r,echo = T, eval = F}
+plot_fun <- function(mody, ypred, raw_eq, filename){
+  ###########
+  # function to visualize glm fit to data
+  # mody = dataframe output 
+  # ypred = mean prediction
+  # raw_eq = pseudo equation (with variable names)
+  # filename = file name prefix  the fit should be saved
+  ############
+  plot_df <- data.frame(data = mody$mean, pred = ypred$mean, lower = ypred$`2.5%`, upper = ypred$`97.5%`) # extract the 
+  glm_out <- glm(pred ~ data, data=plot_df) # generate glm for pred ~ observed
+  rsq <- glm_out$aic # extract aic value
+  print(rsq) # print r-squared
+  plotgg <-ggplot() + # plot fit 
+      geom_point(data = plot_df, aes(x = data, y = pred),col = "black") + # plot predicted points
+      stat_smooth(data = plot_df, aes(x = data, y = lower),col = "gray", alpha=0,method='loess') + 
+      stat_smooth(data = plot_df, aes(x = data, y = upper),col = "gray", alpha=0,method='loess') +
+      theme_bw() +
+      labs(x = "observed", y = "predicted", title = paste0("AIC = ", round(rsq,3)), subtitle = raw_eq) # axes
+  plot_df$diff <- plot_df$data - plot_df$pred # get difference in value between prediction and observed
+  write.csv(plot_df,paste0('path/',filename,'_loess.csv'))
+  lout <- list(plot_df, plotgg)
+  return(plotgg)
+}
+
+ts_plot <- function(ypred, mody, mu_df, ylabel, maxout = T, modtype){
+  #########
+  # plot the predictions against the observed over time, since we are interested in seasonality
+  # ypred = predictions
+  # mody = model output dataframe
+  # mu_df = model output dataframe for means
+  # ylabel = observed 
+  # maxout = indicates whether the max y-axis should be based on the maximum ypred or not
+  # modtype = the model distribution (lnorm, binom, or beta)
+  #########
+
+  if (maxout == T){ # get maximum for the y-axis
+    ymax <- max(ypred$`97.5%`) + max(ypred$`97.5%`)/10
+  }
+  else{
+    ymax <- max(ypred$mean) + max(ypred$mean)/4
+  }
+  # plot against the indices since the data is supposed to be in chronological order
+  plot(1:nrow(ypred), ypred$mean, main = 'time series', xlab = 'time point', ylab = ylabel, 
+       ylim = c(0,ymax), cex = 0.5)
+  points(1:nrow(mody), mody$mean, col = "red",cex = 0.5)
+  # if the model distribution is binomial 
+  if (modtype == 'binom'){
+    # overlay credible interval points, too messy doing a line
+    points(1:nrow(ypred), ypred$`2.5%`, col = alpha("lightgray",0.8),cex = 0.3)
+    points(1:nrow(ypred), ypred$`97.5%`, col = alpha("lightgray",0.8),cex = 0.3)
+    plot(1:nrow(mu_df), mu_df$mean, main = 'time series', xlab = 'time point', ylab = ylabel, 
+         ylim = c(0,ymax), cex = 0.5, col = 'goldenrod')
+    points(1:nrow(mody), mody$mean, col = "red",cex = 0.5)
+  }
+  else{ # plot the credible interval lines
+    lines(1:nrow(ypred), ypred$`2.5%`, type = "l", col = "goldenrod", lty = 1, lwd = 1)
+    lines(1:nrow(ypred), ypred$`97.5%`, type = "l", col = "goldenrod", lty = 1, lwd = 1)
+    if (modtype == 'lnorm'){
+      lines(1:nrow(mu_df), exp(mu_df$`2.5%`, type = "l", col = "turquoise3", lty = 1, lwd = 1)
+      lines(1:nrow(mu_df), exp(mu_df$`97.5%`), type = "l", col = "turquoise3", lty = 1, lwd = 1)
+    }
+    else{
+      lines(1:nrow(mu_df), mu_df$`2.5%`, type = "l", col = "turquoise3", lty = 1, lwd = 1)
+      lines(1:nrow(mu_df), mu_df$`97.5%`, type = "l", col = "turquoise3", lty = 1, lwd = 1)
+    }
+  }
+}  
+
+mcmc_out <- function(model, response, modnum, param, pn, raw_eq, mod_eq1, mod_eq2, ylabel, ts, modtype, n = 7){
+  ###############
+  # function to extract information from the model, visualize it and output to pdf
+  # model = model
+  # response = response variable, will also serve as prefix of filename
+  # modnum = model number
+  # param = vector of model parameters to be plotted in MCMCplot and MCMCtrace
+  # pn = number of parameters, not including sigma
+  # raw_eq = raw model equation
+  # mod_eq1 = mean ~ sink model equation
+  # mod_eq2 = y ~ sink model equation
+  # ylabel = observed y
+  # ts = observed value column prefix from model dataframe output
+  # modtype = model type
+  # n = denominator to use to get proportion 
+  ###############
+  filename <- paste0(response, '_',modnum) # put together the file name
+  sum_df <- as.data.frame(model$BUGSoutput$summary) # get out the summary table from the model
+  write.csv(sum_df,paste0('path/',filename,'.csv')) # output the summary model
+  if (modtype == 'binom'){
+    ptab <- sum_df[1:pn,]
+    bi <- 20 # set bin
+  }
+  else {
+    si <- which(rownames(sum_df) == 'sigma') # get the row index for sigma
+    ptab <- sum_df[c(1:pn,si),] # extract the parameter estimates from the summary table 
+    bi <- 30 # set bin
+  }
+ 
+  ypred <- sum_df[which(substr(rownames(sum_df),1,5) == 'ypred'),] # get out the predicitons
+  mody <- sum_df[which(substr(rownames(sum_df),1,2) == 'y['),] # get out the observed values
+  mu_df <- sum_df[which(substr(rownames(sum_df),1,2) == ts),] # get out the observed values
+
+  if (modtype == 'binom'){
+    n_df <- sum_df[which(substr(rownames(sum_df),1,1) == 'n'),] # get out the observed values
+    ypred[,1:7] <- ypred[,1:7]/n
+    mody[,1:7] <- mody[,1:7]/n
+  }
+  
+  # create empty pdf 
+  pdf(file = paste0('path/',response,'/', filename,'.pdf'), 
+    width = 7.5, height = 4)
+  # plot the observed distribution
+  p1 <- ggplot(mody, aes(mean)) + 
+        geom_histogram(aes(y=..density..), color = 'white', fill = 'grey84', bins = bi) + 
+        ggtitle('observed') + 
+        theme_bw()
+  # plot the predicted distribution 
+  p2 <- ggplot(ypred, aes(mean)) + 
+        geom_histogram(aes(y=..density..), color = 'white', fill = 'grey84', bins = bi) + 
+        ggtitle('predicted') + 
+        theme_bw()
+  # overlay the predicted distribution over the observed distribution
+  p3 <- ggplot(mody, aes(mean)) + 
+        geom_histogram(aes(y=..density..), color = 'white', fill = 'grey84', bins = bi) + 
+        geom_density(data = ypred, aes(mean), size = 0.7,trim = FALSE, col = 'grey50') +
+        ggtitle('model fit') + 
+        theme_bw()
+  # convert table of parameter estimates as plot
+  p4 <- tableGrob(round(ptab,3), rows = rownames(ptab), cols = colnames(ptab), theme = ttheme_default(base_size = 8))
+  # plot the observed, predicted and model fit in same row, add the model equations as titles
+  grid.arrange(p1,p2, p3, ncol = 3, 
+               top=textGrob(paste0("Model ", modnum, ": ", raw_eq, "\n \n", mod_eq1, "\n", mod_eq2, "\n"), 
+                            gp=gpar(fontsize=10)))
+  
+  p5 <- plot_fun(mody,ypred,raw_eq,filename)
+  grid.arrange(p5,nrow=1)
+  if (modtype == 'binom'){
+    ts_plot(ypred, mody, mu_df, ylabel, maxout= T, modtype)
+  }
+  else{
+    ts_plot(ypred, mody, mu_df, ylabel, maxout= F, modtype)
+    ts_plot(ypred, mody, mu_df, ylabel, maxout= T, modtype)
+  }
+  # plot catepillar plots for parameters
+  MCMCtrace(model, params = param, pdf = F)
+  # plot the trace plots for the parameters 
+  MCMCplot(model, params = param)
+  # plot the table
+  grid.arrange(p4, nrow = 1)
+  # write to the pdf and close pdf
+  dev.off()
+  # print out the parameter estimates
+  print(ptab[,1])
+}
+
+```
+
+Normal distribution models
+```{r, echo = T, eval = F}
+sink("bw_adults_norm_cont.jags")
+# create model file
+cat("
+    model {
+      for (i in 1:length(y)){
+        mu[i] <- alpha + inprod(beta[],x[i,])
+        y[i] ~ dnorm(mu[i], tau)
+        ypred[i] ~ dnorm(mu[i], tau)
+        log_lik[i] <- logdensity.norm(y[i],mu[i], tau)
+      }
+      for (i in 1:b){
+        beta[i] ~ dnorm(0,10)
+      }
+      sigma ~ dunif(0,100)
+      tau <- 1/(sigma^2)
+      alpha ~ dnorm(0,10)
+    }",fill = TRUE)
+sink() # complete writing the model to text
+```
+
+```{r, echo = T, warning = F, message = F}
+# set the parameters for the mcmc
+ni <- 100000  # number of draws from the posterior
+nt <- 5    # thinning rate
+nb <- 50000 # number to discard for burn-in
+nc <- 3  # number of chains
+
+par_save <- c("alpha","beta","y","ypred","mu", "log_lik", 'sigma') # set parameters to save
+
+# subset out covariate table 
+covmatv <- bw_std[,c('Young','FlBw')]
+bn <- ncol(covmat) # get number of covariates
+dat <- list(y = bw_df$Adults, x = covmat, b = bn)# data
+init <- function() {list(alpha = rnorm(1,0,10),
+                         beta = rnorm(bn,0,10))}
+
+start.time <- Sys.time()
+jags_out <- jags(inits = init,
+                  n.chains=nc, # chain number
+                  model.file="norm_cont.jags", # model file
+                  working.directory=getwd(), # working directory
+                  data=dat, # data
+                  parameters.to.save = par_save, # parameters to save
+                  n.thin=nt, # thining rate
+                  n.iter=ni, # number of draws from the posterior, iteration number
+                  n.burnin=nb, # burn-in number to discard
+                  DIC=T) # Set as true to compute deviance, expected predictive error
+print(Sys.time() - start.time)
+
+# output results 
+mcmc_out(model = jags_out, response = 'adults', modnum ='1', 
+         param = c('alpha', 'beta','sigma'), 
+         pn = 3, raw_eq ='Adults~young + flowers',
+         mod_eq1 = 'mu[i] <- alpha + beta[1]*young + beta[2]*flowers', 
+         mod_eq2 = 'y[i] ~ dnorm(mu[i], tau)',
+         ylabel = 'counts',ts ='mu', modtype ='norm', n = 24, ci = 0.8)
+
+```
+
+```{r, echo = T, eval = F}
+sink("bw_adults_norm_cat1_cont1.jags")
+# create model file
+cat("
+    model {
+      for (i in 1:length(y)){
+        mu[i] <- alpha+ gamma[group[i]] + beta*x[i]
+        y[i] ~ dnorm(mu[i], tau)
+        ypred[i] ~ dnorm(mu[i], tau)
+        log_lik[i] <- logdensity.norm(y[i],mu[i], tau)
+      }
+      for (i in 1:n){
+        gamma[i] ~ dnorm(0,10)
+      }
+      beta ~ dnorm(0,10)
+      alpha ~ dnorm(0,10)
+      sigma ~ dunif(0,100)
+      tau <- 1/(sigma^2)
+      
+    }",fill = TRUE)
+sink() # complete writing the model to text
+```
+
+```{r, echo = T, warning = F, message = F}
+# set the parameters for the mcmc
+ni <- 100000  # number of draws from the posterior
+nt <- 5    # thinning rate
+nb <- 50000 # number to discard for burn-in
+nc <- 3  # number of chains
+
+par_save <- c("alpha","beta","gamma", "y","ypred","mu", "log_lik", 'sigma') # set parameters to save
+
+# subset out covariate table 
+an <- length(unique(bw_std$MEG))
+dat <- list(y = bw_df$Adults, x = bw_std$Young, group = bw_std$MEG+1, n = an)# data
+init <- function() {list(alpha = rnorm(1,0,10),
+                         beta = rnorm(1,0,10),
+                         gamma = rnorm(an,0,10))}
+
+start.time <- Sys.time()
+jags_out <- jags(inits = init,
+                  n.chains=nc, # chain number
+                  model.file="bw_adults_norm_cat1_cont1.jags", # model file
+                  working.directory=getwd(), # working directory
+                  data=dat, # data
+                  parameters.to.save = par_save, # parameters to save
+                  n.thin=nt, # thining rate
+                  n.iter=ni, # number of draws from the posterior, iteration number
+                  n.burnin=nb, # burn-in number to discard
+                  DIC=T) # Set as true to compute deviance, expected predictive error
+print(Sys.time() - start.time)
+
+# output results 
+mcmc_out(model = jags_out, response = 'adults', modnum ='2', 
+         param = c('alpha', 'beta','gamma','sigma'), 
+         pn = 4, raw_eq ='Adults~young + MEG',
+         mod_eq1 = 'mu[i] <- alpha+ beta*young[i] + gamma[MEG[i]]', 
+         mod_eq2 = 'y[i] ~ dnorm(mu[i], tau)',
+         ylabel = 'counts',ts ='mu', modtype ='norm', n = 7, ci = 0.8)
+```
+
+```{r, echo = T, eval = F}
+sink("bw_adults_norm_cat1_cont.jags")
+# create model file
+cat("
+    model {
+      for (i in 1:length(y)){
+        mu[i] <- alpha+ gamma[group[i]] + inprod(beta[],x[i,])
+        y[i] ~ dnorm(mu[i], tau)
+        ypred[i] ~ dnorm(mu[i], tau)
+        log_lik[i] <- logdensity.norm(y[i],mu[i], tau)
+      }
+      for (i in 1:n){
+        gamma[i] ~ dnorm(0,10)
+      }
+      for (i in 1:b){
+        beta[i] ~ dnorm(0,10)
+      }
+      alpha ~ dnorm(0,10)
+      sigma ~ dunif(0,100)
+      tau <- 1/(sigma^2)
+      
+    }",fill = TRUE)
+sink() # complete writing the model to text
+```
+
+```{r, echo = T, warning = F, message = F}
+# set the parameters for the mcmc
+ni <- 100000  # number of draws from the posterior
+nt <- 5    # thinning rate
+nb <- 50000 # number to discard for burn-in
+nc <- 3  # number of chains
+
+par_save <- c("alpha","beta","gamma", "y","ypred","mu", "log_lik", 'sigma') # set parameters to save
+
+# subset out covariate table 
+an <- length(unique(bw_std$MEG))
+conmatv <- bw_std[,c('Young','FlBw')]
+bn <- ncol(conmatv)
+dat <- list(y = bw_df$Adults, x = conmatv, group = bw_std$MEG+1, n = an, b = bn)# data
+init <- function() {list(alpha = rnorm(1,0,10),
+                         beta = rnorm(bn,0,10),
+                         gamma = rnorm(an,0,10))}
+
+start.time <- Sys.time()
+jags_out <- jags(inits = init,
+                  n.chains=nc, # chain number
+                  model.file="bw_adults_norm_cat1_cont.jags", # model file
+                  working.directory=getwd(), # working directory
+                  data=dat, # data
+                  parameters.to.save = par_save, # parameters to save
+                  n.thin=nt, # thining rate
+                  n.iter=ni, # number of draws from the posterior, iteration number
+                  n.burnin=nb, # burn-in number to discard
+                  DIC=T) # Set as true to compute deviance, expected predictive error
+print(Sys.time() - start.time)
+
+# output results 
+mcmc_out(model = jags_out, response = 'adults', modnum ='3', 
+         param = c('alpha', 'beta','gamma','sigma'), 
+         pn = 5, raw_eq ='Adults~young + flowers + reprostate',
+         mod_eq1 = 'mu[i] <- alpha+ gamma[MEG[i]] + beta[1]*young[i] + beta[2]*flowers', 
+         mod_eq2 = 'y[i] ~ dnorm(mu[i], tau)',
+         ylabel = 'counts',ts ='mu', modtype ='norm', n = 7, ci = 0.8)
+```
+```{r, echo = T, eval = F}
+sink("bw_adults_norm_cat1.jags")
+# create model file
+cat("
+    model {
+      for (i in 1:length(y)){
+        mu[i] <- alpha+ gamma[group[i]]
+        y[i] ~ dnorm(mu[i], tau)
+        ypred[i] ~ dnorm(mu[i], tau)
+        log_lik[i] <- logdensity.norm(y[i],mu[i], tau)
+      }
+      for (i in 1:n){
+        gamma[i] ~ dnorm(0,10)
+      }
+      alpha ~ dnorm(0,10)
+      sigma ~ dunif(0,100)
+      tau <- 1/(sigma^2)
+      
+    }",fill = TRUE)
+sink() # complete writing the model to text
+```
+
+```{r, echo = T, warning = F, message = F}
+# set the parameters for the mcmc
+ni <- 100000  # number of draws from the posterior
+nt <- 5    # thinning rate
+nb <- 50000 # number to discard for burn-in
+nc <- 3  # number of chains
+
+par_save <- c("alpha","gamma", "y","ypred","mu", "log_lik", 'sigma') # set parameters to save
+
+# subset out covariate table 
+an <- length(unique(bw_std$reprostate))
+dat <- list(y = bw_df$Adults, group = bw_std$reprostate, n = an)# data
+init <- function() {list(alpha = rnorm(1,0,10),
+                         gamma = rnorm(an,0,10))}
+
+start.time <- Sys.time()
+jags_out <- jags(inits = init,
+                  n.chains=nc, # chain number
+                  model.file="bw_adults_norm_cat1.jags", # model file
+                  working.directory=getwd(), # working directory
+                  data=dat, # data
+                  parameters.to.save = par_save, # parameters to save
+                  n.thin=nt, # thining rate
+                  n.iter=ni, # number of draws from the posterior, iteration number
+                  n.burnin=nb, # burn-in number to discard
+                  DIC=T) # Set as true to compute deviance, expected predictive error
+print(Sys.time() - start.time)
+
+# output results 
+mcmc_out(model = jags_out, response = 'adults', modnum ='4', 
+         param = c('alpha','gamma','sigma'), 
+         pn = 5, raw_eq ='Adults~reprostate',
+         mod_eq1 = 'mu[i] <- alpha+ gamma[reprostate[i]]', 
+         mod_eq2 = 'y[i] ~ dnorm(mu[i], tau)',
+         ylabel = 'counts',ts ='mu', modtype ='norm', n = 7, ci = 0.8)
+```
+
+```{r, echo = T, eval = F}
+sink("bw_adults_norm_cont1.jags")
+# create model file
+cat("
+    model {
+      for (i in 1:length(y)){
+        mu[i] <- alpha+ beta*x[i]
+        y[i] ~ dnorm(mu[i], tau)
+        ypred[i] ~ dnorm(mu[i], tau)
+        log_lik[i] <- logdensity.norm(y[i],mu[i], tau)
+      }
+      alpha ~ dnorm(0,10)
+      beta ~ dnorm(0,10)
+      sigma ~ dunif(0,100)
+      tau <- 1/(sigma^2)
+      
+    }",fill = TRUE)
+sink() # complete writing the model to text
+```
+
+```{r, echo = T, warning = F, message = F}
+# set the parameters for the mcmc
+ni <- 100000  # number of draws from the posterior
+nt <- 5    # thinning rate
+nb <- 50000 # number to discard for burn-in
+nc <- 3  # number of chains
+
+par_save <- c("alpha","beta","y","ypred","mu", "log_lik", 'sigma') # set parameters to save
+
+# subset out covariate table 
+dat <- list(y = bw_df$Adults, x = bw_std$fruit_prop)# data
+init <- function() {list(alpha = rnorm(1,0,10),
+                         beta = rnorm(1,0,10))}
+
+start.time <- Sys.time()
+jags_out <- jags(inits = init,
+                  n.chains=nc, # chain number
+                  model.file="bw_adults_norm_cont1.jags", # model file
+                  working.directory=getwd(), # working directory
+                  data=dat, # data
+                  parameters.to.save = par_save, # parameters to save
+                  n.thin=nt, # thining rate
+                  n.iter=ni, # number of draws from the posterior, iteration number
+                  n.burnin=nb, # burn-in number to discard
+                  DIC=T) # Set as true to compute deviance, expected predictive error
+print(Sys.time() - start.time)
+
+# output results 
+mcmc_out(model = jags_out, response = 'adults_bw', modnum ='5', 
+         param = c('alpha', 'beta','sigma'), 
+         pn = 2, raw_eq ='Adults~fruit_prop',
+         mod_eq1 = 'mu[i] <- alpha+ beta*fruit_prop[i]', 
+         mod_eq2 = 'y[i] ~ dnorm(mu[i], tau)',
+         ylabel = 'counts',ts ='mu', modtype ='norm', n = 7, ci = 0.8)
+```
+```{r, echo = T, eval = F}
+sink("bw_adults_norm_cat2_cont1.jags")
+# create model file
+cat("
+    model {
+      for (i in 1:length(y)){
+        mu[i] <- alpha+ gamma[groupn[i]] + chi[groupm[i]] + beta*x[i]
+        y[i] ~ dnorm(mu[i], tau)
+        ypred[i] ~ dnorm(mu[i], tau)
+        log_lik[i] <- logdensity.norm(y[i],mu[i], tau)
+      }
+      for (i in 1:n){
+        gamma[i] ~ dnorm(0,10)
+      }
+      for (i in 1:m){
+        chi[i] ~ dnorm(0,10)
+      }
+      alpha ~ dnorm(0,10)
+      beta ~ dnorm(0,10)
+      sigma ~ dunif(0,100)
+      tau <- 1/(sigma^2)
+      
+    }",fill = TRUE)
+sink() # complete writing the model to text
+```
+
+```{r, echo = T, warning = F, message = F}
+# set the parameters for the mcmc
+ni <- 100000  # number of draws from the posterior
+nt <- 5    # thinning rate
+nb <- 50000 # number to discard for burn-in
+nc <- 3  # number of chains
+
+par_save <- c("alpha","beta","chi", "gamma", "y","ypred","mu", "log_lik", 'sigma') # set parameters to save
+
+# subset out covariate table 
+an <- length(unique(bw_std$reprostate))
+bn <- length(unique(bw_std$year))
+dat <- list(y = bw_df$Adults, x = bw_std$Young, groupn = bw_std$reprostate, n = an,
+            groupm = bw_std$year, m = bn)# data
+init <- function() {list(alpha = rnorm(1,0,10),
+                         beta = rnorm(1,0,10),
+                         chi= rnorm(bn,0,10),
+                         gamma = rnorm(an,0,10))}
+
+start.time <- Sys.time()
+jags_out <- jags(inits = init,
+                  n.chains=nc, # chain number
+                  model.file="bw_adults_norm_cat2_cont1.jags", # model file
+                  working.directory=getwd(), # working directory
+                  data=dat, # data
+                  parameters.to.save = par_save, # parameters to save
+                  n.thin=nt, # thining rate
+                  n.iter=ni, # number of draws from the posterior, iteration number
+                  n.burnin=nb, # burn-in number to discard
+                  DIC=T) # Set as true to compute deviance, expected predictive error
+print(Sys.time() - start.time)
+
+# output results 
+mcmc_out(model = jags_out, response = 'adults', modnum ='6', 
+         param = c('alpha','beta','chi','gamma','sigma'), 
+         pn = 16, raw_eq ='Adults~reprostate + year + young',
+         mod_eq1 = 'mu[i] <- alpha+ gamma[reprostate[i]] + chi[year[i]] + beta*young[i]', 
+         mod_eq2 = 'y[i] ~ dnorm(mu[i], tau)',
+         ylabel = 'counts',ts ='mu', modtype ='norm', n = 7, ci = 0.8)
+```
+```{r, echo = T, eval = F}
+sink("bw_adults_norm_cat2_cont1_var1.jags")
+# create model file
+cat("
+    model {
+      for (i in 1:length(y)){
+        mu[i] <- alpha+ gamma[groupn[i]] + chi[groupm[i]] + beta*x[i]
+        y[i] ~ dnorm(mu[i], tau[groupv[i]])
+        ypred[i] ~ dnorm(mu[i], tau[groupv[i]])
+        log_lik[i] <- logdensity.norm(y[i],mu[i], tau[groupv[i]])
+      }
+      for (i in 1:n){
+        gamma[i] ~ dnorm(0,10)
+      }
+      for (i in 1:m){
+        chi[i] ~ dnorm(0,10)
+      }
+      for (i in 1:v){
+        sigma[i] ~ dunif(0,100)
+        tau[i] <- 1/(sigma[i]^2)
+      }
+      alpha ~ dnorm(0,10)
+      beta ~ dnorm(0,10)
+    }",fill = TRUE)
+sink() # complete writing the model to text
+```
+
+```{r, echo = T, warning = F, message = F}
+# set the parameters for the mcmc
+ni <- 100000  # number of draws from the posterior
+nt <- 5    # thinning rate
+nb <- 50000 # number to discard for burn-in
+nc <- 3  # number of chains
+
+par_save <- c("alpha","beta","chi", "gamma", "y","ypred","mu", "log_lik", 'sigma') # set parameters to save
+
+# subset out covariate table 
+an <- length(unique(bw_std$MEG))
+bn <- length(unique(bw_std$year))
+vn <- length(unique(bw_std$Young0))
+dat <- list(y = bw_df$Adults, x = bw_std$Infants, groupn = bw_std$MEG, n = an,
+            groupm = bw_std$year, m = bn, groupv = bw_std$Young0, v = vn)# data
+
+init <- function() {list(alpha = rnorm(1,0,10),
+                         beta = rnorm(1,0,10),
+                         chi= rnorm(bn,0,10),
+                         gamma = rnorm(an,0,10),
+                         sigma = runif(vn,1,100))}
+
+start.time <- Sys.time()
+jags_out <- jags(inits = init,
+                  n.chains=nc, # chain number
+                  model.file="bw_adults_norm_cat2_cont1_var1.jags", # model file
+                  working.directory=getwd(), # working directory
+                  data=dat, # data
+                  parameters.to.save = par_save, # parameters to save
+                  n.thin=nt, # thining rate
+                  n.iter=ni, # number of draws from the posterior, iteration number
+                  n.burnin=nb, # burn-in number to discard
+                  DIC=T) # Set as true to compute deviance, expected predictive error
+print(Sys.time() - start.time)
+
+# output results 
+mcmc_out(model = jags_out, response = 'adults', modnum ='7', 
+         param = c('alpha','beta','chi','gamma','sigma'), 
+         pn = 16, raw_eq ='Adults~MEG + year + young0',
+         mod_eq1 = 'mu[i] <- alpha+ gamma[MEG[i]] + chi[year[i]] + beta*young[i]', 
+         mod_eq2 = 'y[i] ~ dnorm(mu[i], tau[young0])',
+         ylabel = 'counts',ts ='mu', modtype ='norm', n = 7, ci = 0.8)
+```
+
+Beta distribution models
+```{r, echo = T, eval = F}
+sink("bw_activity_beta_cont1.jags")
+# create model file
+cat("
+    model {
+      for(i in 1:length(y)){
+        logit(pi[i]) <- alpha2 + beta2*x[i]
+        shape1[i] <- eta*pi[i]
+        shape2[i] <- eta*(1-pi[i])
+        y[i] ~ dbeta(shape1[i],shape2[i]) T(0.00001,0.99999)
+        ypred[i] ~ dbeta(shape1[i],shape2[i]) T(0.00001,0.99999)
+        log_lik[i] <- logdensity.beta(y[i],shape1[i], shape2[i])
+      }
+    alpha2 ~ dnorm(0,1)
+    beta2 ~ dnorm(0,1)
+    eta ~ dgamma(0.1,0.1)
+ }",fill = TRUE)
+sink() # complete writing the model to text
+```
+
+```{r, echo = T, warning = F, message = F}
+# set the parameters for the mcmc
+ni <- 10000  # number of draws from the posterior
+nt <- 1    # thinning rate
+nb <- 1000 # number to discard for burn-in
+nc <- 3  # number of chains
+
+par_save <- c("alpha2","beta2","eta", "y","ypred","shape1", "shape2", "pi","log_lik") # set parameters to save
+
+# subset out covariate table 
+dat <- list(y = bw_df$feed, x = bw_std$adults)# data
+
+init <- function() {list(alpha = rnorm(1,0,1),
+                         beta= rnorm(1,0,1),
+                         eta = rgamma(1,10,10))}
+
+start.time <- Sys.time()
+jags_out <- jags(inits = init,
+                  n.chains=nc, # chain number
+                  model.file="bw_activity_beta_cont1.jags", # model file
+                  working.directory=getwd(), # working directory
+                  data=dat, # data
+                  parameters.to.save = par_save, # parameters to save
+                  n.thin=nt, # thining rate
+                  n.iter=ni, # number of draws from the posterior, iteration number
+                  n.burnin=nb, # burn-in number to discard
+                  DIC=T) # Set as true to compute deviance, expected predictive error
+print(Sys.time() - start.time)
+
+# output results 
+mcmc_out(model = jags_out, response = 'feed', modnum ='1', 
+         param = c("alpha2","beta2","eta"), 
+         pn = 3, raw_eq ='feed~ adults',
+         mod_eq1 = 'logit(pi[i]) <- alpha2 + beta2*x[i] \n shape1[i] <- eta*pi[i] \t shape2[i] <- eta*(1-pi[i])', 
+         mod_eq2 = 'y[i] ~ dbeta(shape1[i],shape2[i])',
+         ylabel = 'proportion',ts ='pi', modtype ='beta', n = 24, ci = 0.8)
+```
+
+```{r, echo = T, eval = F}
+sink("bw_activity_beta_cont.jags")
+# create model file
+cat("
+    model {
+      
+      for(i in 1:length(y)){
+        logit(pi[i]) <- alpha2 + inprod(beta2[],x[i,])
+        shape1[i] <- eta*pi[i]
+        shape2[i] <- eta*(1-pi[i])
+        y[i] ~ dbeta(shape1[i],shape2[i])
+        ypred[i] ~ dbeta(shape1[i],shape2[i]) 
+        log_lik[i] <- logdensity.beta(y[i],shape1[i], shape2[i])
+      }
+    for (i in 1:b){
+        beta2[i] ~ dnorm(0,1)
+      }
+    alpha2 ~ dnorm(0,1)
+    eta ~ dgamma(0.1,0.1)
+ }",fill = TRUE)
+sink() # complete writing the model to text
+```
+
+```{r, echo = T, warning = F, message = F}
+# set the parameters for the mcmc
+ni <- 10000  # number of draws from the posterior
+nt <- 1    # thinning rate
+nb <- 1000 # number to discard for burn-in
+nc <- 3  # number of chains
+
+par_save <- c("alpha2","beta2","eta", "y","ypred","shape1", "shape2", "pi","log_lik") # set parameters to save
+
+# subset out covariate table 
+covmat <- bw_std[,c('FlBw','Juveniles')]
+bn <- ncol(covmat) # get number of covariates
+dat <- list(y = bw_df$feed, x = covmat, b = bn)# data
+init <- function() {list(alpha2 = rnorm(1,0,1),
+                         beta2 = rnorm(bn,0,1))}
+
+start.time <- Sys.time()
+jags_out <- jags(inits = init,
+                  n.chains=nc, # chain number
+                  model.file="bw_activity_beta_cont.jags", # model file
+                  working.directory=getwd(), # working directory
+                  data=dat, # data
+                  parameters.to.save = par_save, # parameters to save
+                  n.thin=nt, # thining rate
+                  n.iter=ni, # number of draws from the posterior, iteration number
+                  n.burnin=nb, # burn-in number to discard
+                  DIC=T) # Set as true to compute deviance, expected predictive error
+print(Sys.time() - start.time)
+
+# output results 
+mcmc_out(model = jags_out, response = 'feed', modnum ='2', 
+         param = c("alpha2","beta2","eta"), 
+         pn = 14, raw_eq ='feed ~ FlBw + Juveniles',
+         mod_eq1 = 'logit(pi[i]) <- alpha2 + beta2[1]*FlBw + beta2[2]*Juveniles\n shape1[i] <- eta*pi[i] \t shape2[i] <- eta*(1-pi[i])', 
+         mod_eq2 = 'y[i] ~ dbeta(shape1[i],shape2[i])',
+         ylabel = 'proportion',ts ='pi', modtype ='beta', n = 24, ci = 0.8)
+```
+
+```{r, echo = T, eval = F}
+sink("bw_activity_beta_cat1_cont1.jags")
+# create model file
+cat("
+    model {
+      
+      for(i in 1:length(y)){
+        logit(pi[i]) <- alpha2 + beta2*x[i] + gamma2[group[i]]
+        shape1[i] <- eta*pi[i]
+        shape2[i] <- eta*(1-pi[i])
+        y[i] ~ dbeta(shape1[i],shape2[i])
+        ypred[i] ~ dbeta(shape1[i],shape2[i]) 
+        log_lik[i] <- logdensity.beta(y[i],shape1[i], shape2[i])
+      }
+    for (i in 1:n){
+        gamma2[i] ~ dnorm(0,1)
+    }
+    alpha2 ~ dnorm(0,1)
+    beta2 ~ dnorm(0,1)
+    eta ~ dgamma(0.1,0.1)
+ }",fill = TRUE)
+sink() # complete writing the model to text
+```
+
+```{r, echo = T, warning = F, message = F}
+ni <- 400000  # number of draws from the posterior
+nt <- 20    # thinning rate
+nb <- 200000 # number to discard for burn-in
+nc <- 3  # number of chains
+
+# set the parameters for the mcmc
+par_save <- c("alpha2","beta2","eta", "gamma2", "y","ypred","shape1", "shape2", "pi","log_lik") # set parameters to save
+
+an <- length(unique(bw_std$year))
+# subset out covariate table 
+dat <- list(y = bw_df$feed, x = bw_std$adult_juveniles, group = bw_std$year, n = an)# data
+
+init <- function() {list(alpha = rnorm(1,0,1),
+                         beta= rnorm(1,0,1),
+                         eta = rgamma(1,10,10),
+                         gamma = rnorm(an,0,1))}
+
+start.time <- Sys.time()
+jags_out <- jags(inits = init,
+                  n.chains=nc, # chain number
+                  model.file="bw_activity_beta_cat1_cont1.jags", # model file
+                  working.directory=getwd(), # working directory
+                  data=dat, # data
+                  parameters.to.save = par_save, # parameters to save
+                  n.thin=nt, # thining rate
+                  n.iter=ni, # number of draws from the posterior, iteration number
+                  n.burnin=nb, # burn-in number to discard
+                  DIC=T) # Set as true to compute deviance, expected predictive error
+print(Sys.time() - start.time)
+
+
+# output results 
+mcmc_out(model = jags_out, response = 'feed', modnum ='3', 
+         param = c("alpha2","beta2","eta", "gamma2"), 
+         pn = 14, raw_eq ='feed~ adult_juveniles + year',
+         mod_eq1 = 'logit(pi[i]) <- alpha2 + beta2*x[i] \n shape1[i] <- eta*pi[i] \t shape2[i] <- eta*(1-pi[i])', 
+         mod_eq2 = 'y[i] ~ dbeta(shape1[i],shape2[i])',
+         ylabel = 'proportion',ts ='pi', modtype ='beta', n = 24, ci = 0.8)
+
+```{r, echo = T, eval = F}
+sink("bw_activity_beta_cat1_cont.jags")
+# create model file
+cat("
+    model {
+      
+      for(i in 1:length(y)){
+        logit(pi[i]) <- alpha2 + inprod(beta2[],x[i,]) + gamma2[group[i]]
+        shape1[i] <- eta*pi[i]
+        shape2[i] <- eta*(1-pi[i])
+        y[i] ~ dbeta(shape1[i],shape2[i])
+        ypred[i] ~ dbeta(shape1[i],shape2[i]) 
+        log_lik[i] <- logdensity.beta(y[i],shape1[i], shape2[i])
+      }
+    for (i in 1:n){
+        gamma2[i] ~ dnorm(0,1)
+    }
+    for (i in 1:b){
+        beta2[i] ~ dnorm(0,10)
+      }
+    alpha2 ~ dnorm(0,1)
+    eta ~ dgamma(0.1,0.1)
+ }",fill = TRUE)
+sink() # complete writing the model to text
+```
+
+```{r, echo = T, warning = F, message = F}
+ni <- 400000  # number of draws from the posterior
+nt <- 20    # thinning rate
+nb <- 200000 # number to discard for burn-in
+nc <- 3  # number of chains
+par_save <- c("alpha2","beta2","eta", "gamma2", "y","ypred","shape1", "shape2", "pi","log_lik") # set parameters to save
+
+an <- length(unique(bw_std$year))
+covmatv <- bw_std[,c('FlBw','adult_juveniles')]
+bn <- ncol(covmatv) # get number of covariates
+
+# subset out covariate table 
+dat <- list(y = bw_df$feed, x = covmatv, group = bw_std$year, n = an, b = bn)# data
+
+init <- function() {list(alpha2 = rnorm(1,0,1),
+                         beta2= rnorm(bn,0,1),
+                         eta = rgamma(1,10,10),
+                         gamma2 = rnorm(an,0,1))}
+
+start.time <- Sys.time()
+jags_out <- jags(inits = init,
+                  n.chains=nc, # chain number
+                  model.file="bw_activity_beta_cat1_cont.jags", # model file
+                  working.directory=getwd(), # working directory
+                  data=dat, # data
+                  parameters.to.save = par_save, # parameters to save
+                  n.thin=nt, # thining rate
+                  n.iter=ni, # number of draws from the posterior, iteration number
+                  n.burnin=nb, # burn-in number to discard
+                  DIC=T) # Set as true to compute deviance, expected predictive error
+print(Sys.time() - start.time)
+
+
+# output results 
+mcmc_out(model = jags_out, response = 'feed_bw', modnum ='4', 
+         param = c("alpha2","beta2","gamma2", "eta"), 
+         pn = 14, raw_eq ='feed~ year + FlBw + adult_juveniles',
+         mod_eq1 = 'logit(pi[i]) <- alpha2 + beta2[1]*FlBw[i] + beta2[2]*adult_juveniles[i] \n shape1[i] <- eta*pi[i] \t shape2[i] <- eta*(1-pi[i])', 
+         mod_eq2 = 'y[i] ~ dbeta(shape1[i],shape2[i])',
+         ylabel = 'proportion',ts ='pi', modtype ='beta', n = 24, ci = 0.8)
+```
+
+Binomial distributed models
+```{r, echo = T, eval = F}
+# build the model with a binomial distribution for continuous & categorical variable
+sink("bw_treechange_binom_cat1_cont.jags")
+# create model file
+cat("
+    model {
+      for (i in 1:j){
+        alpha[i] ~ dnorm(0, 0.1)
+      }
+      for (i in 1:b){
+        beta[i] ~ dnorm(0,0.1)
+      }
+      for (i in 1:length(y)){
+        logit(p[i]) <- alpha[group[i]] + beta[1]*frbw[i] + beta[2]*feed[i]
+        y[i] ~ dbin(p[i], n[i])
+        ypred[i] ~ dbin(p[i], n[i])
+      }
+    }",fill = TRUE)
+sink() # complete writing the model to text
+
+```
+
+```{r, echo = T, warning = F, message = F}
+bn <- 2
+jn <- max(bw_std$year)
+
+dat <- list(y = bw_df$treechange, n = bw_df$tc_n, b = bn, j = jn, 
+            group = bw_std$year, frbw = bw_std$FrBw, 
+            feed = bw_std$Feed) # data
+
+init <- function() {list(alpha = rnorm(jn,0,10),
+                         beta = rnorm(bn,0,10))}
+par_save <- c("alpha", "beta","y","ypred","p","n") # set parameters to save
+
+# set the parameters for the mcmc
+ni <- 10000  # number of draws from the posterior
+nt <- 1    # thinning rate
+nb <- 1000  # number to discard for burn-in
+nc <- 3  # number of chains
+
+jags_out <- jags(inits = init,
+                  n.chains=nc, # chain number
+                  model.file="bw_treechange_binom_cat1_cont.jags", # model file
+                  working.directory=getwd(), # working directory
+                  data=dat, # data
+                  parameters.to.save = par_save, # parameters to save
+                  n.thin=nt, # thining rate
+                  n.iter=ni, # number of draws from the posterior, iteration number
+                  n.burnin=nb, # burn-in number to discard
+                  DIC=T) # Set as true to compute deviance, expected predictive error
+
+# output results 
+mcmc_out(model = jags_out, response = 'treechange', modnum ='1', 
+         param = c('alpha', 'beta'),
+         pn = 12, raw_eq ='tc_avg~FrBw+Feed+year',
+         mod_eq1 = 'logit(p[i]) <- alpha[group[i]] + beta[1]*frbw[i] + beta[2]*feed[i]', 
+         mod_eq2 = 'y[i] ~ dbin(p[i], n[i])', ylabel = 'proportion',ts ='p[', n = bw_df$tc_n, modtype ='binom')
+```
+
+```{r, echo = T, eval = F}
+# build the model with a binomial distribution for continuous & categorical variable
+sink("bw_treechange_binom_cat2_cont.jags")
+# create model file
+cat("
+    model {
+      for (i in 1:j){
+        alpha_j[i] ~ dnorm(0, 0.2)
+      }
+      for (i in 1:k){
+        alpha_k[i] ~ dnorm(0, 0.2)
+      }
+      for (i in 1:b){
+        beta[i] ~ dnorm(0,0.2)
+      }
+      for (i in 1:length(y)){
+        logit(p[i]) <- alpha_j[group_j[i]] + alpha_k[group_k[i]] + beta[1]*frbw[i] + beta[2]*feed[i]
+        y[i] ~ dbin(p[i], n[i])
+        ypred[i] ~ dbin(p[i], n[i])
+      }
+    }",fill = TRUE)
+sink() # complete writing the model to text
+
+```
+
+```{r, echo = T, warning = F, message = F}
+bn <- 2
+jn <- max(bw_std$year)
+kn <- max(bw_std$reprostate)
+
+dat <- list(y = bw_df$treechange, n = bw_df$tc_n, b = bn, j = jn, k = kn, 
+            group_j = bw_std$year, group_k = bw_std$reprostate, 
+            frbw = bw_std$FrBw,feed = bw_std$Feed) # data
+
+init <- function() {list(alpha_j = rnorm(jn,0,5), alpha_k = rnorm(kn,0,5),
+                         beta = rnorm(bn,0,5))}
+par_save <- c("alpha_j", "alpha_k","beta","y","ypred","p","n") # set parameters to save
+
+# set the parameters for the mcmc
+ni <- 10000  # number of draws from the posterior
+nt <- 1    # thinning rate
+nb <- 1000  # number to discard for burn-in
+nc <- 3  # number of chains
+
+jags_out <- jags(inits = init,
+                  n.chains=nc, # chain number
+                  model.file="bw_treechange_binom_cat2_cont.jags", # model file
+                  working.directory=getwd(), # working directory
+                  data=dat, # data
+                  parameters.to.save = par_save, # parameters to save
+                  n.thin=nt, # thining rate
+                  n.iter=ni, # number of draws from the posterior, iteration number
+                  n.burnin=nb, # burn-in number to discard
+                  DIC=T) # Set as true to compute deviance, expected predictive error
+
+# output results 
+mcmc_out(model = jags_out, response = 'treechange', modnum ='2', 
+         param = c('alpha_j', 'alpha_k','beta'),
+         pn = 16, raw_eq ='tc_avg~reprostate+FrBw+Feed+year',
+         mod_eq1 = 'logit(p[i]) <- alpha_j[group_j[i]] + alpha_k[group_k[i]] + beta[1]*frbw[i] + beta[2]*feed[i]', 
+         mod_eq2 = 'y[i] ~ dbin(p[i], n[i])', ylabel = 'proportion',ts ='p[', n = bw_df$tc_n, modtype ='binom')
+```
+```{r, echo = T, eval = F}
+# build the model with a binomial distribution for continuous & categorical variable
+sink("bw_treechange_binom_cat3_cont.jags")
+# create model file
+cat("
+    model {
+      for (i in 1:j){
+        alpha_j[i] ~ dnorm(0, 0.2)
+      }
+      for (i in 1:k){
+        alpha_k[i] ~ dnorm(0, 0.2)
+      }
+      for (i in 1:m){
+        alpha_m[i] ~ dnorm(0, 0.2)
+      }
+      for (i in 1:b){
+        beta[i] ~ dnorm(0,0.2)
+      }
+      for (i in 1:length(y)){
+        logit(p[i]) <- alpha_j[group_j[i]] + alpha_k[group_k[i]] + alpha_m[group_m[i]] + beta[1]*frbw[i] + beta[2]*feed[i]
+        y[i] ~ dbin(p[i], n[i])
+        ypred[i] ~ dbin(p[i], n[i])
+      }
+    }",fill = TRUE)
+sink() # complete writing the model to text
+
+```
+
+```{r, echo = T, warning = F, message = F}
+bn <- 2
+jn <- max(bw_std$year)
+kn <- max(bw_std$reprostate)
+mn <- max(bw_std$population)
+
+dat <- list(y = bw_df$treechange, n = bw_df$tc_n, b = bn, j = jn, k = kn, m = mn,
+            group_j = bw_std$year, group_k = bw_std$reprostate, group_m = bw_std$population,
+            frbw = bw_std$FrBw,feed = bw_std$Feed) # data
+
+init <- function() {list(alpha_j = rnorm(jn,0,5), alpha_k = rnorm(kn,0,5), alpha_m = rnorm(mn,0,5),
+                         beta = rnorm(bn,0,5))}
+par_save <- c("alpha_j","alpha_k","alpha_m","beta","y","ypred","p","n") # set parameters to save
+
+# set the parameters for the mcmc
+ni <- 10000  # number of draws from the posterior
+nt <- 1    # thinning rate
+nb <- 1000  # number to discard for burn-in
+nc <- 3  # number of chains
+
+jags_out <- jags(inits = init,
+                  n.chains=nc, # chain number
+                  model.file="bw_treechange_binom_cat3_cont.jags", # model file
+                  working.directory=getwd(), # working directory
+                  data=dat, # data
+                  parameters.to.save = par_save, # parameters to save
+                  n.thin=nt, # thining rate
+                  n.iter=ni, # number of draws from the posterior, iteration number
+                  n.burnin=nb, # burn-in number to discard
+                  DIC=T) # Set as true to compute deviance, expected predictive error
+
+# output results 
+mcmc_out(model = jags_out, response = 'treechange', modnum ='3', 
+         param = c('alpha_j', 'alpha_k','alpha_m','beta'),
+         pn = 18, raw_eq ='tc_avg~reprostate+FrBw+Feed+year+population',
+         mod_eq1 = 'logit(p[i]) <- alpha_j[group_j[i]] + alpha_k[group_k[i]] + alpha_m[group_m[i]] + beta[1]*frbw[i] + beta[2]*feed[i]', 
+         mod_eq2 = 'y[i] ~ dbin(p[i], n[i])', ylabel = 'proportion',ts ='p[', n = df$tc_n, modtype ='binom')
+```
+
+```{r, echo = T, warning = F, message = F}
+# build the model with a binomial distribution for continuous & categorical variable
+sink("full_treechange_zbinom_cont.jags")
+# create model file
+cat("
+    model {
+      for (i in 1:length(y)){
+        logit(p[i]) <- beta[1]*frbw[i] + beta[2]*feed[i] + beta[3]*frprop[i]
+        w[i] ~ dbern(chi)
+        pi[i] <- w[i]*p[i]
+        y[i] ~ dbin(pi[i], n[i])
+        ypred[i] ~ dbin(pi[i], n[i])
+      }
+      for (i in 1:b){
+        beta[i] ~ dnorm(0,0.1)
+      }
+      chi ~ dunif(0,1)
+    }",fill = TRUE)
+sink() # complete writing the model to text
+
+```
+
+```{r, echo = T, warning = F, message = F}
+bn <- 3
+dat <- list(y = df$treechange, n = rep(7, nrow(df)), w = df$treechange0,
+            frbw = std_full$FrBw, feed = std_full$Feed, frprop = std_full$fruit_prop, 
+            b = bn)# data
+
+init <- function() {list(chi = runif(1,0,1),
+                         beta = rnorm(bn,0,10))}
+par_save <- c("beta","chi","y","ypred","pi") # set parameters to save
+
+# set the parameters for the mcmc
+ni <- 10000  # number of draws from the posterior
+nt <- 1    # thinning rate
+nb <- 1000  # number to discard for burn-in
+nc <- 3  # number of chains
+
+jags_out<- jags(inits = init,
+                  n.chains=nc, # chain number
+                  model.file="full_treechange_zbinom_cont.jags", # model file
+                  working.directory=getwd(), # working directory
+                  data=dat, # data
+                  parameters.to.save = par_save, # parameters to save
+                  n.thin=nt, # thining rate
+                  n.iter=ni, # number of draws from the posterior, iteration number
+                  n.burnin=nb, # burn-in number to discard
+                  DIC=T) # Set as true to compute deviance, expected predictive error
+
+# output results 
+mcmc_out(model = jags_out, response = 'treechange', modnum ='4', 
+         param = c('alpha', 'beta','chi'), 
+         pn = 5, raw_eq ='treechange~fruit_prop+FrBw+Feed',
+         mod_eq1 = 'logit(p[i]) <- beta[1]*frbw[i] + beta[2]*feed[i] + beta[3]*frprop', 
+         mod_eq2 = 'w[i] ~ dbern(chi) \t \t pi[i] <- w[i]*p[i] \t \t y[i] ~ dbin(pi[i], n[i])',
+         ylabel = 'proportion',ts ='pi', n =7, modtype ='binom')
+
+```

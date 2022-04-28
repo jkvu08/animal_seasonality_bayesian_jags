@@ -1,0 +1,20 @@
+
+    model {
+      for (i in 1:j){
+        alpha_j[i] ~ dnorm(0, 0.2)
+      }
+      for (i in 1:k){
+        alpha_k[i] ~ dnorm(0, 0.2)
+      }
+      for (i in 1:m){
+        alpha_m[i] ~ dnorm(0, 0.2)
+      }
+      for (i in 1:b){
+        beta[i] ~ dnorm(0,0.2)
+      }
+      for (i in 1:length(y)){
+        logit(p[i]) <- alpha_j[group_j[i]] + alpha_k[group_k[i]] + alpha_m[group_m[i]] + beta[1]*frbw[i] + beta[2]*feed[i]
+        y[i] ~ dbin(p[i], n[i])
+        ypred[i] ~ dbin(p[i], n[i])
+      }
+    }

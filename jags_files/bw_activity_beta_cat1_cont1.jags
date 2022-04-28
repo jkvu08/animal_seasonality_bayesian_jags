@@ -1,0 +1,18 @@
+
+    model {
+      
+      for(i in 1:length(y)){
+        logit(pi[i]) <- alpha2 + beta2*x[i] + gamma2[group[i]]
+        shape1[i] <- eta*pi[i]
+        shape2[i] <- eta*(1-pi[i])
+        y[i] ~ dbeta(shape1[i],shape2[i])
+        ypred[i] ~ dbeta(shape1[i],shape2[i]) 
+        log_lik[i] <- logdensity.beta(y[i],shape1[i], shape2[i])
+      }
+    for (i in 1:n){
+        gamma2[i] ~ dnorm(0,1)
+    }
+    alpha2 ~ dnorm(0,1)
+    beta2 ~ dnorm(0,1)
+    eta ~ dgamma(0.1,0.1)
+ }
